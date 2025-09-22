@@ -1,0 +1,199 @@
+pipeline {
+    agent any
+    
+    environment {
+        // Docker registry credentials
+        DOCKER_REGISTRY = credentials('docker-registry-url')
+        DOCKER_CREDENTIALS = credentials('docker-registry-credentials')
+        
+        // Application configuration
+        APP_NAME = 'healthcare-backend'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        
+        // Deployment configuration
+        DEPLOY_HOST = credentials('deploy-host')
+        DEPLOY_USER = credentials('deploy-user')
+        DEPLOY_KEY = credentials('deploy-ssh-key')
+        
+        // Environment variables
+        NODE_ENV = 'production'
+        DB_HOST = credentials('db-host')
+        DB_NAME = credentials('db-name')
+        DB_USER = credentials('db-user')
+        DB_PASSWORD = credentials('db-password')
+        JWT_SECRET = credentials('jwt-secret')
+        JWT_REFRESH_SECRET = credentials('jwt-refresh-secret')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Install Dependencies') {
+            steps {
+                dir('backend') {
+                    sh 'npm ci'
+                }
+            }
+        }
+        
+        stage('Lint') {
+            steps {
+                dir('backend') {
+                    sh 'npm run lint'
+                }
+            }
+        }
+        
+        stage('Test') {
+            steps {
+                dir('backend') {
+                    sh 'npm test'
+                }
+            }
+            post {
+                always {
+                    publishTestResults testResultsPattern: 'backend/test-results.xml'
+                    publishCoverageGoberturaReports(
+                        coberturaReportFile: 'backend/coverage/cobertura-coverage.xml'
+                    )
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            steps {
+                dir('backend') {
+                    sh 'npm audit --audit-level moderate'
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                dir('backend') {
+                    script {
+                        def image = docker.build("${DOCKER_REGISTRY}/${APP_NAME}:${IMAGE_TAG}")
+                        
+                        // Tag with latest for production
+                        if (env.BRANCH_NAME == 'main') {
+                            image.tag('latest')
+                        }
+                        
+                        // Tag with git commit
+                        image.tag(env.GIT_COMMIT_SHORT)
+                    }
+                }
+            }
+        }
+        
+        stage('Push Docker Image') {
+            steps {
+                script {
+                    docker.withRegistry("https://${DOCKER_REGISTRY}", env.DOCKER_CREDENTIALS) {
+                        def image = docker.image("${DOCKER_REGISTRY}/${APP_NAME}:${IMAGE_TAG}")
+                        image.push()
+                        image.push(env.GIT_COMMIT_SHORT)
+                        
+                        if (env.BRANCH_NAME == 'main') {
+                            image.push('latest')
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    deployToEnvironment('staging')
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    // Require manual approval for production
+                    input message: 'Deploy to production?', ok: 'Deploy'
+                    deployToEnvironment('production')
+                }
+            }
+        }
+        
+        stage('Health Check') {
+            steps {
+                script {
+                    def environment = env.BRANCH_NAME == 'main' ? 'production' : 'staging'
+                    healthCheck(environment)
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Clean up Docker images
+            sh "docker rmi ${DOCKER_REGISTRY}/${APP_NAME}:${IMAGE_TAG} || true"
+            sh "docker system prune -f"
+        }
+        
+        success {
+            slackSend(
+                channel: '#deployments',
+                color: 'good',
+                message: "✅ Healthcare Backend deployed successfully!\nBranch: ${env.BRANCH_NAME}\nBuild: ${env.BUILD_NUMBER}\nCommit: ${env.GIT_COMMIT_SHORT}"
+            )
+        }
+        
+        failure {
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: "❌ Healthcare Backend deployment failed!\nBranch: ${env.BRANCH_NAME}\nBuild: ${env.BUILD_NUMBER}\nCommit: ${env.GIT_COMMIT_SHORT}"
+            )
+        }
+    }
+}
+
+def deployToEnvironment(environment) {
+    def deployPath = "/opt/healthcare/${environment}"
+    def composeFile = environment == 'production' ? 'docker-compose.prod.yml' : 'docker-compose.staging.yml'
+    
+    sshagent([env.DEPLOY_KEY]) {
+        sh """
+            ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} '
+                cd ${deployPath} &&
+                docker-compose -f ${composeFile} pull backend &&
+                docker-compose -f ${composeFile} up -d backend &&
+                docker-compose -f ${composeFile} exec -T backend npm run migrate
+            '
+        """
+    }
+}
+
+def healthCheck(environment) {
+    def healthUrl = environment == 'production' ? 
+        'https://api.healthcare.com/health' : 
+        'https://staging-api.healthcare.com/health'
+    
+    retry(5) {
+        sleep(10)
+        sh "curl -f ${healthUrl}"
+    }
+}
