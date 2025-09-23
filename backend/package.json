@@ -10,6 +10,8 @@
     "test:watch": "jest --watch",
     "migrate": "node src/database/migrate.js",
     "seed": "node src/database/seed.js",
+    "migrate": "node src/database/migrate.js",
+    "seed": "node src/database/seed.js",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix"
   },
